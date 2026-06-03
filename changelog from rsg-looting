@@ -1,0 +1,74 @@
+all changes that are made from rsg-looting to LmZa_Looting
+
+# LmZa_Looting — Changelog
+
+Migrated and rebuilt from `rsg-looting` v1.0.3.
+
+---
+
+## [1.0.0] — Initial Release
+
+### Breaking Changes
+- Player robbery system removed entirely (see below)
+
+---
+
+### Security
+
+- **Server-side loot validation** — the loot reward is now granted through a callback (`LmZa_Looting:server:requestLoot`) rather than a fire-and-forget `RegisterNetEvent`. The server controls all reward logic; clients receive only the result. Previously any client could trigger the reward event directly without performing any loot action.
+- **Per-player rate limiting** — players are capped at 3 loot reward requests per 10-second window. Excess requests are blocked and logged server-side as a possible exploit attempt. Both thresholds are configurable in `config.lua`.
+- **Per-body cooldown** — each looted body is stamped by its network entity ID server-side. No player can re-loot the same body until the cooldown expires (default 60 seconds). The cooldown is applied immediately on the first valid request, blocking concurrent requests from multiple players simultaneously.
+- **Removed player robbery** — `rsg-looting:server:robplayermoney` and the associated client `RobPlayer` event have been removed. The previous implementation had no server-side proximity or authorization check, meaning any client could rob any player's full wallet remotely by firing the event directly.
+
+---
+
+### Bug Fixes
+
+- **Dead NPC gate restored** — `IsEntityDead()` was commented out in the original, allowing players to loot living NPCs freely. The check is now enforced at two points: when the body is first detected, and again after the hold completes, closing the window between detection and reward.
+- **`player` variable used before assignment** — in the original client thread, `IsPedInAnyVehicle(player, true)` referenced `player` before it was declared in the inner scope. The client thread is restructured so `PlayerPedId()` is always called before use.
+- **Loot flag re-validated after hold** — after the key is released the native loot flag (`0x8DE41E9902E85756`) is re-checked before the server callback is triggered. If the flag is not set, the action is silently cancelled rather than sending a server request.
+
+---
+
+### Improvements
+
+- **Weighted loot tables** — `CommonItems` and `RareItems` now use `{ item, weight }` entries instead of flat arrays. Drop rates are controlled by relative weights making them easy to tune without manually calculating percentages. Both tiers ship with real items instead of placeholder bread/water entries.
+- **Expanded loot tables** — common tier includes bandages, herbal remedy, tobacco, matches, chewing tobacco, and jerky. Rare tier includes gold nuggets, valuable jewelry, gemstones, silver earrings, pocket watches, and family heirlooms.
+- **Configurable cash ranges** — `Config.CommonCash` and `Config.RareCash` expose `min`/`max` values for cash rewards rather than hardcoded `math.random` calls scattered through server code.
+- **Consistent notifications** — all player-facing notifications now use `ox_lib`'s `lib.notify`. The original mixed `RSGCore.Functions.Notify` and `ox_lib:notify` across the same script.
+- **Rare loot feedback** — players receive a distinct `★ Rare find!` notification title when they receive a rare drop, with the item name and cash amount in the description.
+- **Lawman alert toggle** — `Config.TriggerLawman` controls whether looting a body fires the lawman alert. Previously hardcoded and always on.
+
+---
+
+### Performance
+
+- **Adaptive thread polling** — the main client thread idles at `Wait(500)` when no lootable body is nearby. It tightens to `Wait(0)` only while a body is in range and returns to idle immediately after the loot action completes or the player walks away. The original ran a permanent `Wait(0)` tick loop for every connected player regardless of context.
+- **Removed permanent conductor proximity thread** — the original spawned one always-on `Wait(1)` thread per train conductor. Not applicable to this resource but removed as part of the overall cleanup.
+- **Server-side memory cleanup** — a background thread runs every 5 minutes to purge expired body cooldown entries and stale rate-limit records. Rate-limit entries are also cleared immediately on player disconnect, preventing unbounded table growth on busy servers.
+
+---
+
+### Configuration Reference
+
+| Key | Default | Description |
+|---|---|---|
+| `Config.LootHoldTime` | `500` | Milliseconds the key must be held to trigger a loot |
+| `Config.LootRadius` | `2.0` | Metres around the player scanned for a lootable body |
+| `Config.BodyCooldown` | `60` | Seconds before a body can be looted again by anyone |
+| `Config.RateLimitMax` | `3` | Max loot requests per player within the window |
+| `Config.RateLimitWindow` | `10` | Seconds for the rate-limit sliding window |
+| `Config.RareChance` | `5` | Percentage chance of a rare drop (0–100) |
+| `Config.CommonCash` | `{min=1, max=5}` | Cash reward range for common loot |
+| `Config.RareCash` | `{min=10, max=25}` | Cash reward range for rare loot |
+| `Config.TriggerLawman` | `true` | Fire lawman alert on successful loot |
+
+---
+
+### Dependencies
+
+| Dependency | Status |
+|---|---|
+| `rsg-core` | Required (unchanged) |
+| `rsg-lawman` | Required (unchanged) |
+| `ox_lib` | Added — used for all client notifications |
