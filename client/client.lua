@@ -4,159 +4,134 @@ local RSGCore = exports['rsg-core']:GetCoreObject()
 -- State
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local isLooting   = false   -- prevents re-entry while a loot action is in progress
-local lootKey     = 1101824977  -- INPUT_CONTEXT (same key as original)
+-- bodyCooldowns[entityNetId] = game-time (seconds) when the cooldown expires
+local bodyCooldowns = {}
+
+-- rateLimiter[source] = { count = n, windowStart = os.time() }
+local rateLimiter = {}
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Helpers
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Returns the nearest dead NPC within Config.LootRadius, or nil
-local function getNearbyDeadNPC()
-    local player = PlayerPedId()
-    local coords = GetEntityCoords(player)
-
-    local shapeTest = StartShapeTestBox(
-        coords.x, coords.y, coords.z,
-        Config.LootRadius * 2, Config.LootRadius * 2, Config.LootRadius * 2,
-        0.0, 0.0, 0.0,
-        true, 8, player
-    )
-    local _, hit, _, _, entityHit = GetShapeTestResult(shapeTest)
-
-    if not hit or entityHit == 0 then return nil end
-
-    -- Must be a human NPC (type 4) and actually dead
-    if GetPedType(entityHit) ~= 4 then return nil end
-    if not IsEntityDead(entityHit)  then return nil end
-
-    -- Must not have already been looted (native loot flag)
-    if Citizen.InvokeNative(0x8DE41E9902E85756, entityHit) then return nil end
-
-    return entityHit
+local function log(msg)
+    print(('[^5LmZa_Looting^7] %s'):format(msg))
 end
 
--- Draw a simple 2D text hint above the crosshair
-local function drawHint(text)
-    SetTextFont(0)
-    SetTextProportional(1)
-    SetTextScale(0.0, 0.35)
-    SetTextColour(255, 255, 255, 215)
-    SetTextDropshadow(0, 0, 0, 0, 255)
-    SetTextEdge(2, 0, 0, 0, 150)
-    SetTextDropShadow()
-    SetTextOutline()
-    SetTextEntry('STRING')
-    AddTextComponentString(text)
-    DrawText(0.5, 0.85)
+-- Weighted random pick from a table of { item, weight } entries
+local function weightedRandom(tbl)
+    local total = 0
+    for _, entry in ipairs(tbl) do
+        total = total + entry.weight
+    end
+    local roll = math.random(1, total)
+    local cumulative = 0
+    for _, entry in ipairs(tbl) do
+        cumulative = cumulative + entry.weight
+        if roll <= cumulative then
+            return entry.item
+        end
+    end
+    return tbl[#tbl].item -- fallback
+end
+
+-- Returns true if this source has exceeded the rate limit
+local function isRateLimited(src)
+    local now = os.time()
+    local record = rateLimiter[src]
+    if not record or (now - record.windowStart) >= Config.RateLimitWindow then
+        rateLimiter[src] = { count = 1, windowStart = now }
+        return false
+    end
+    record.count = record.count + 1
+    if record.count > Config.RateLimitMax then
+        log(('RATE LIMIT hit by source %d (^1possible exploit^7)'):format(src))
+        return true
+    end
+    return false
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Main thread  (sleeps at 500 ms when idle; tightens only while looting)
+-- Loot reward callback (called by client only after the native confirms looted)
 -- ─────────────────────────────────────────────────────────────────────────────
 
+RSGCore.Functions.CreateCallback('LmZa_Looting:server:requestLoot', function(source, cb, entityNetId)
+    local src = source
+    local Player = RSGCore.Functions.GetPlayer(src)
+
+    -- 1. Player must exist
+    if not Player then
+        log(('Unknown player src=%d tried to loot'):format(src))
+        cb(false, 'invalid_player')
+        return
+    end
+
+    -- 2. Rate limit
+    if isRateLimited(src) then
+        cb(false, 'rate_limited')
+        return
+    end
+
+    -- 3. Body cooldown – keyed on the network entity ID supplied by the client
+    if entityNetId then
+        local now = os.time()
+        local expiry = bodyCooldowns[entityNetId]
+        if expiry and now < expiry then
+            cb(false, 'already_looted')
+            return
+        end
+        -- Stamp the cooldown immediately so concurrent requests from other players are also blocked
+        bodyCooldowns[entityNetId] = now + Config.BodyCooldown
+    end
+
+    -- 4. Build reward
+    local isRare  = math.random(1, 100) <= Config.RareChance
+    local pool    = isRare and Config.RareItems or Config.CommonItems
+    local cashCfg = isRare and Config.RareCash   or Config.CommonCash
+    local item    = weightedRandom(pool)
+    local cash    = math.random(cashCfg.min, cashCfg.max)
+
+    -- 5. Grant reward
+    Player.Functions.AddItem(item, 1)
+    Player.Functions.AddMoney('cash', cash, 'looting-reward')
+
+    -- 6. Notify inventory UI
+    TriggerClientEvent('inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'add')
+
+    -- 7. Log
+    local name = Player.PlayerData.charinfo.firstname .. ' ' .. Player.PlayerData.charinfo.lastname
+    local tier = isRare and 'RARE' or 'common'
+    TriggerEvent('rsg-log:server:CreateLog', 'loot', 'looted 🌟', 'orange',
+        ('%s found %s (%s) + $%d'):format(name, item, tier, cash))
+
+    log(('%s looted %s (%s) +$%d'):format(name, item, tier, cash))
+
+    cb(true, item, cash, isRare)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Cleanup stale cooldown entries periodically (every 5 min)
+-- ─────────────────────────────────────────────────────────────────────────────
 CreateThread(function()
     while true do
-        Wait(500)   -- idle poll: check whether we should wake up
-
-        -- Skip entirely while in a vehicle or already mid-loot
-        if IsPedInAnyVehicle(PlayerPedId(), true) or isLooting then
-            goto continue
-        end
-
-        local entity = getNearbyDeadNPC()
-        if not entity then goto continue end
-
-        -- ── We have a nearby lootable body – switch to tight loop for responsiveness ──
-        local hintShown = false
-        while true do
-            Wait(0)
-
-            -- Re-check each frame in case player walked away
-            if not getNearbyDeadNPC() then
-                break   -- back to idle 500 ms loop
-            end
-
-            drawHint('Hold [~INPUT_CONTEXT~] to loot')
-
-            if IsControlJustPressed(0, lootKey) then
-                local pressTime = GetGameTimer()
-                isLooting = true
-
-                -- Hold-detection inner loop
-                while true do
-                    Wait(0)
-                    drawHint('Looting...')
-
-                    if IsControlJustReleased(0, lootKey) then
-                        local held = GetGameTimer() - pressTime
-
-                        if held >= Config.LootHoldTime then
-                            -- Small pause so the native loot-flag settles
-                            Wait(300)
-
-                            -- Re-validate: still dead? still unlooted?
-                            if not IsEntityDead(entity) then
-                                lib.notify({ title = 'Looting', description = 'Nothing to loot.', type = 'inform' })
-                                isLooting = false
-                                break
-                            end
-
-                            local alreadyLooted = Citizen.InvokeNative(0x8DE41E9902E85756, entity)
-                            if not alreadyLooted then
-                                lib.notify({ title = 'Looting', description = 'Nothing to loot.', type = 'inform' })
-                                isLooting = false
-                                break
-                            end
-
-                            -- Request reward from server, passing network ID for cooldown keying
-                            local entityNetId = NetworkGetNetworkIdFromEntity(entity)
-                            RSGCore.Functions.TriggerCallback('LmZa_Looting:server:requestLoot', function(success, itemOrReason, cash, isRare)
-                                if success then
-                                    local tier = isRare and '★ Rare find!' or 'Common loot'
-                                    lib.notify({
-                                        title       = tier,
-                                        description = ('Found %s and $%d'):format(itemOrReason, cash),
-                                        type        = 'success',
-                                        duration    = 5000,
-                                    })
-                                    if Config.TriggerLawman then
-                                        TriggerServerEvent('rsg-lawman:server:lawmanAlert', 'Someone is looting a body')
-                                    end
-                                else
-                                    local msgs = {
-                                        already_looted = 'This body has already been looted.',
-                                        rate_limited   = 'You are looting too quickly.',
-                                        invalid_player = 'Something went wrong.',
-                                    }
-                                    lib.notify({
-                                        title       = 'Looting',
-                                        description = msgs[itemOrReason] or 'Could not loot.',
-                                        type        = 'error',
-                                        duration    = 4000,
-                                    })
-                                end
-                                isLooting = false
-                            end, entityNetId)
-
-                        else
-                            -- Key not held long enough
-                            isLooting = false
-                        end
-                        break
-                    end
-
-                    -- Player moved away while holding key – cancel
-                    if not getNearbyDeadNPC() then
-                        isLooting = false
-                        break
-                    end
-                end
-
-                break   -- exit tight loop back to 500 ms idle
+        Wait(300000)
+        local now = os.time()
+        for netId, expiry in pairs(bodyCooldowns) do
+            if now >= expiry then
+                bodyCooldowns[netId] = nil
             end
         end
-
-        ::continue::
+        for src, record in pairs(rateLimiter) do
+            if (now - record.windowStart) >= Config.RateLimitWindow * 2 then
+                rateLimiter[src] = nil
+            end
+        end
     end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Cleanup player rate-limit entry on disconnect
+-- ─────────────────────────────────────────────────────────────────────────────
+AddEventHandler('playerDropped', function()
+    rateLimiter[source] = nil
 end)
