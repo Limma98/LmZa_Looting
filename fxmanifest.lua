@@ -2,8 +2,8 @@ fx_version 'cerulean'
 rdr3_warning 'I acknowledge that this is a prerelease build of RedM, and I am aware my resources *will* become incompatible once RedM ships.'
 game 'rdr3'
 
-description 'rsg-looting'
-version '1.0.3'
+description 'LmZa_Looting'
+version '1.0.0'
 
 client_script {
     'client/client.lua',
@@ -19,7 +19,8 @@ shared_scripts {
 
 dependencies {
     'rsg-core',
-    'rsg-lawman'
+    'rsg-lawman',
+    'ox_lib',
 }
 
 lua54 'yes'
