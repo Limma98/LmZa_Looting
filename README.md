@@ -1,2 +1,3 @@
 # rsg-looting
- 
+
+ [redm][rsg]
