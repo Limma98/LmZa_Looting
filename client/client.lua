@@ -1,102 +1,162 @@
 local RSGCore = exports['rsg-core']:GetCoreObject()
-local looting = false
 
-Citizen.CreateThread(function()
-    while true do
-        Citizen.Wait(0)
-        if IsControlJustPressed(0, 1101824977) and not IsPedInAnyVehicle(player, true) and not looting then
-            local shape = true
-            while shape do
-                Wait(0)
-                local player = PlayerPedId()
-                local coords = GetEntityCoords(player)
-                local entityHit = 0
-                local shapeTest = StartShapeTestBox(coords.x, coords.y, coords.z, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, true, 8, player)
-                local rtnVal, hit, endCoords, surfaceNormal, entityHit = GetShapeTestResult(shapeTest)
-                local type = GetPedType(entityHit)
-                --local dead = IsEntityDead(entityHit)
-                local PressTime = 0
-                --if type == 4 and dead then -- only dead npcs
-                if type == 4 then
-                    local looted = Citizen.InvokeNative(0x8DE41E9902E85756, entityHit)
-                    if not looted then
-                        shape = false
-                        looting = true
-                        PressTime = GetGameTimer()
-                        while looting do
-                            Wait(0)
-                            if IsControlJustReleased(0, 1101824977) then
-                                KeyHeldTime = GetGameTimer() - PressTime
-                                PressTime = 0
-                                if KeyHeldTime > 250 then
-                                    looting = false
-                                    Wait(500)
-                                    local lootedcheck = Citizen.InvokeNative(0x8DE41E9902E85756, entityHit)
-                                    if lootedcheck then
-                                        TriggerServerEvent('rsg-looting:server:lootreward')
-                                        TriggerServerEvent('rsg-lawman:server:lawmanAlert', 'People are getting looted')
-                                    else
-                                        looting = false
-                                    end
-                                else
-                                    looting = false
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-end)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- State
+-- ─────────────────────────────────────────────────────────────────────────────
 
--- is player dead
-local function IsTargetDead(playerId)
-    local retval = false
-    local hasReturned = false
-    RSGCore.Functions.TriggerCallback('rsg-looting:server:isPlayerDead', function(result)
-        retval = result
-        hasReturned = true
-    end, playerId)
-    while not hasReturned do
-        Wait(10)
-    end
-    return retval
+local isLooting   = false   -- prevents re-entry while a loot action is in progress
+local lootKey     = 1101824977  -- INPUT_CONTEXT (same key as original)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Returns the nearest dead NPC within Config.LootRadius, or nil
+local function getNearbyDeadNPC()
+    local player = PlayerPedId()
+    local coords = GetEntityCoords(player)
+
+    local shapeTest = StartShapeTestBox(
+        coords.x, coords.y, coords.z,
+        Config.LootRadius * 2, Config.LootRadius * 2, Config.LootRadius * 2,
+        0.0, 0.0, 0.0,
+        true, 8, player
+    )
+    local _, hit, _, _, entityHit = GetShapeTestResult(shapeTest)
+
+    if not hit or entityHit == 0 then return nil end
+
+    -- Must be a human NPC (type 4) and actually dead
+    if GetPedType(entityHit) ~= 4 then return nil end
+    if not IsEntityDead(entityHit)  then return nil end
+
+    -- Must not have already been looted (native loot flag)
+    if Citizen.InvokeNative(0x8DE41E9902E85756, entityHit) then return nil end
+
+    return entityHit
 end
 
--- rob other player
-RegisterNetEvent('rsg-looting:client:RobPlayer', function()
-    local player, distance = RSGCore.Functions.GetClosestPlayer()
-    local ped = PlayerPedId()
-    if player ~= -1 and distance < 2.5 then
-        local playerPed = GetPlayerPed(player)
-        local playerId = GetPlayerServerId(player)
-        if IsEntityPlayingAnim(playerPed, "script_proc@robberies@homestead@lonnies_shack@deception", "hands_up_loop", 3) or IsTargetDead(playerId) then
-            RSGCore.Functions.Progressbar("robbing_player", "Robbing Player", math.random(5000, 7000), false, true, {
-                disableMovement = true,
-                disableCarMovement = true,
-                disableMouse = false,
-                disableCombat = true,
-            }, {
-                animDict = "script_rc@cldn@ig@rsc2_ig1_questionshopkeeper",
-                anim = "inspectfloor_player",
-                flags = 16,
-            }, {}, {}, function() -- Done
-                local plyCoords = GetEntityCoords(playerPed)
-                local pos = GetEntityCoords(ped)
-                if #(pos - plyCoords) < 2.5 then
-                    StopAnimTask(ped, "script_rc@cldn@ig@rsc2_ig1_questionshopkeeper", "inspectfloor_player", 1.0)
-                    TriggerServerEvent("inventory:server:OpenInventory", "otherplayer", playerId)
-                    TriggerServerEvent("rsg-looting:server:robplayermoney", playerId)
-                else
-                    RSGCore.Functions.Notify("Player not nearby!", "error")
-                end
-            end, function() -- Cancel
-                StopAnimTask(ped, "script_rc@cldn@ig@rsc2_ig1_questionshopkeeper", "inspectfloor_player", 1.0)
-                RSGCore.Functions.Notify("Action Canceled", "error")
-            end)
+-- Draw a simple 2D text hint above the crosshair
+local function drawHint(text)
+    SetTextFont(0)
+    SetTextProportional(1)
+    SetTextScale(0.0, 0.35)
+    SetTextColour(255, 255, 255, 215)
+    SetTextDropshadow(0, 0, 0, 0, 255)
+    SetTextEdge(2, 0, 0, 0, 150)
+    SetTextDropShadow()
+    SetTextOutline()
+    SetTextEntry('STRING')
+    AddTextComponentString(text)
+    DrawText(0.5, 0.85)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Main thread  (sleeps at 500 ms when idle; tightens only while looting)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CreateThread(function()
+    while true do
+        Wait(500)   -- idle poll: check whether we should wake up
+
+        -- Skip entirely while in a vehicle or already mid-loot
+        if IsPedInAnyVehicle(PlayerPedId(), true) or isLooting then
+            goto continue
         end
-    else
-        RSGCore.Functions.Notify("Player not nearby!", "error")
+
+        local entity = getNearbyDeadNPC()
+        if not entity then goto continue end
+
+        -- ── We have a nearby lootable body – switch to tight loop for responsiveness ──
+        local hintShown = false
+        while true do
+            Wait(0)
+
+            -- Re-check each frame in case player walked away
+            if not getNearbyDeadNPC() then
+                break   -- back to idle 500 ms loop
+            end
+
+            drawHint('Hold [~INPUT_CONTEXT~] to loot')
+
+            if IsControlJustPressed(0, lootKey) then
+                local pressTime = GetGameTimer()
+                isLooting = true
+
+                -- Hold-detection inner loop
+                while true do
+                    Wait(0)
+                    drawHint('Looting...')
+
+                    if IsControlJustReleased(0, lootKey) then
+                        local held = GetGameTimer() - pressTime
+
+                        if held >= Config.LootHoldTime then
+                            -- Small pause so the native loot-flag settles
+                            Wait(300)
+
+                            -- Re-validate: still dead? still unlooted?
+                            if not IsEntityDead(entity) then
+                                lib.notify({ title = 'Looting', description = 'Nothing to loot.', type = 'inform' })
+                                isLooting = false
+                                break
+                            end
+
+                            local alreadyLooted = Citizen.InvokeNative(0x8DE41E9902E85756, entity)
+                            if not alreadyLooted then
+                                lib.notify({ title = 'Looting', description = 'Nothing to loot.', type = 'inform' })
+                                isLooting = false
+                                break
+                            end
+
+                            -- Request reward from server, passing network ID for cooldown keying
+                            local entityNetId = NetworkGetNetworkIdFromEntity(entity)
+                            RSGCore.Functions.TriggerCallback('LmZa_Looting:server:requestLoot', function(success, itemOrReason, cash, isRare)
+                                if success then
+                                    local tier = isRare and '★ Rare find!' or 'Common loot'
+                                    lib.notify({
+                                        title       = tier,
+                                        description = ('Found %s and $%d'):format(itemOrReason, cash),
+                                        type        = 'success',
+                                        duration    = 5000,
+                                    })
+                                    if Config.TriggerLawman then
+                                        TriggerServerEvent('rsg-lawman:server:lawmanAlert', 'Someone is looting a body')
+                                    end
+                                else
+                                    local msgs = {
+                                        already_looted = 'This body has already been looted.',
+                                        rate_limited   = 'You are looting too quickly.',
+                                        invalid_player = 'Something went wrong.',
+                                    }
+                                    lib.notify({
+                                        title       = 'Looting',
+                                        description = msgs[itemOrReason] or 'Could not loot.',
+                                        type        = 'error',
+                                        duration    = 4000,
+                                    })
+                                end
+                                isLooting = false
+                            end, entityNetId)
+
+                        else
+                            -- Key not held long enough
+                            isLooting = false
+                        end
+                        break
+                    end
+
+                    -- Player moved away while holding key – cancel
+                    if not getNearbyDeadNPC() then
+                        isLooting = false
+                        break
+                    end
+                end
+
+                break   -- exit tight loop back to 500 ms idle
+            end
+        end
+
+        ::continue::
     end
 end)
